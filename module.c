@@ -9,123 +9,182 @@
 #define class_create(owner, name) class_create(name)
 #endif
 
-static int dummy(void) { return -ENODEV; }
-static void do_flush_cache(void) {
-  get_cpu();
+static void do_flush_cache(void *dummy) {
 #if defined(__x86_64__) || defined(__i486__)
-  wbinvd_on_all_cpus();
+  wbinvd();
 #else
   flush_cache_all();
 #endif
-  put_cpu();
 }
-static void do_flush_tlb(void) { __flush_tlb_all(); }
+#if defined(__x86_64__) || defined(__i386__)
+static void do_flush_ept(void *dummy) {
+  struct {
+    uint64_t eptp, reserved;
+  } __attribute__((packed)) descriptor = {0};
+  uint64_t type = 2;
+
+  asm volatile("invept %[descriptor], %[type]"
+               :
+               : [descriptor] "m"(descriptor), [type] "r"(type)
+               : "cc", "memory");
+}
+#endif
+static void do_flush_tlb(void *dummy) { __flush_tlb_all(); }
 
 static int flusher_open(struct inode *inode, struct file *file) {
-  return dummy();
+  return -ENODEV;
 }
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .open = flusher_open,
 };
 
-static ssize_t flusher_sysfs_read(struct kobject *kobj,
-                                  struct kobj_attribute *attr, char *buf) {
-  return dummy();
+static struct kobject *kobj_cache,
+#if defined(__x86_64__) || defined(__i386__)
+    *kobj_npt = NULL,
+#endif
+    *kobj_tlb;
+static ssize_t flusher_sysfs_read_invalid(struct kobject *kobj,
+                                          struct kobj_attribute *attr,
+                                          char *buf) {
+  return -ENODEV;
 }
-
-static ssize_t flusher_sysfs_write_cache(struct kobject *kobj,
-                                         struct kobj_attribute *attr,
-                                         const char *buf, size_t count) {
-  int internal = 0;
-  sscanf(buf, "%d", &internal);
-  if (internal == 1) {
-    do_flush_cache();
-    return count;
-  }
-  return dummy();
+static ssize_t flusher_sysfs_write(struct kobject *kobj,
+                                   struct kobj_attribute *attr, const char *buf,
+                                   size_t count) {
+  if (kobj == kobj_cache)
+    on_each_cpu(do_flush_cache, NULL, 1);
+#if defined(__x86_64__) || defined(__i386__)
+  else if (kobj == kobj_npt)
+    on_each_cpu(do_flush_ept, NULL, 1);
+#endif
+  else if (kobj == kobj_tlb)
+    on_each_cpu(do_flush_tlb, NULL, 1);
+  else
+    return -ENODEV;
+  return count;
 }
-static ssize_t flusher_sysfs_write_tlb(struct kobject *kobj,
-                                       struct kobj_attribute *attr,
-                                       const char *buf, size_t count) {
-  int internal = 0;
-  sscanf(buf, "%d", &internal);
-  if (internal == 1) {
-    do_flush_tlb();
-    return count;
-  }
-  return dummy();
-}
+static struct kobj_attribute flusher_attr =
+    __ATTR(flush, 0660, flusher_sysfs_read_invalid, flusher_sysfs_write);
 
 static dev_t dev;
 static struct cdev cdev;
 static struct class *class;
 static struct device *device;
-static struct kobject *kobj_cache, *kobj_tlb;
-static struct kobj_attribute attr_cache =
-                                 __ATTR(flush_cache, 0660, flusher_sysfs_read,
-                                        flusher_sysfs_write_cache),
-                             attr_tlb =
-                                 __ATTR(flush_tlb, 0660, flusher_sysfs_read,
-                                        flusher_sysfs_write_tlb);
+
+enum out_layer {
+  out_dev,
+  out_cdev,
+  out_class,
+  out_device,
+  out_kobj_cache,
+  out_kobj_npt,
+  out_kobj_tlb,
+  out_sysfs_cache,
+  out_sysfs_npt,
+  out_sysfs_tlb,
+  out_full
+};
+static void flusher_cleanup(enum out_layer layer) {
+  switch (layer) {
+  case out_full:
+    fallthrough;
+  case out_sysfs_tlb:
+    sysfs_remove_file(kobj_tlb, &flusher_attr.attr);
+    fallthrough;
+  case out_sysfs_npt:
+    if (kobj_npt)
+      sysfs_remove_file(kobj_npt, &flusher_attr.attr);
+    fallthrough;
+  case out_sysfs_cache:
+    sysfs_remove_file(kobj_cache, &flusher_attr.attr);
+    fallthrough;
+  case out_kobj_tlb:
+    kobject_del(kobj_tlb);
+    kobject_put(kobj_tlb);
+    fallthrough;
+  case out_kobj_npt:
+    if (kobj_npt) {
+      kobject_del(kobj_npt);
+      kobject_put(kobj_npt);
+    }
+    fallthrough;
+  case out_kobj_cache:
+    kobject_del(kobj_cache);
+    kobject_put(kobj_cache);
+    fallthrough;
+  case out_device:
+    device_destroy(class, dev);
+    fallthrough;
+  case out_class:
+    class_destroy(class);
+    fallthrough;
+  case out_cdev:
+    cdev_del(&cdev);
+    fallthrough;
+  case out_dev:
+    unregister_chrdev_region(dev, 1);
+  }
+}
+
 static int __init flusher_init(void) {
   long ret;
+  long long ept_vpid_cap;
+
   if (IS_ERR_VALUE(ret = alloc_chrdev_region(&dev, 0, 1, THIS_MODULE->name)))
     return ret;
 
   cdev_init(&cdev, &fops);
-
-  if (IS_ERR_VALUE(ret = cdev_add(&cdev, dev, 1)))
-    goto out_dev;
+  if (IS_ERR_VALUE(ret = cdev_add(&cdev, dev, 1))) {
+    flusher_cleanup(out_dev);
+    return ret;
+  }
 
   if (IS_ERR(class = class_create(THIS_MODULE, THIS_MODULE->name))) {
-    ret = PTR_ERR(class);
-    goto out_cdev;
+    flusher_cleanup(out_cdev);
+    return PTR_ERR(class);
   }
 
   if (IS_ERR(device =
                  device_create(class, NULL, dev, NULL, THIS_MODULE->name))) {
-    ret = PTR_ERR(device);
-    goto out_class;
+    flusher_cleanup(out_class);
+    return PTR_ERR(device);
   }
 
-  kobj_cache = kobject_create_and_add("cache", kernel_kobj);
-  kobj_tlb = kobject_create_and_add("tlb", kernel_kobj);
+  if (!(kobj_cache = kobject_create_and_add("cache", kernel_kobj))) {
+    flusher_cleanup(out_device);
+    return -ENOMEM;
+  }
+#if defined(__x86_64__) || defined(__i386__)
+  rdmsrl_safe(MSR_IA32_VMX_EPT_VPID_CAP, &ept_vpid_cap);
+  if (ept_vpid_cap & (1 << 26) &&
+      !(kobj_npt = kobject_create_and_add("npt", kernel_kobj))) {
+    flusher_cleanup(out_kobj_cache);
+    return -ENOMEM;
+  }
+#endif
+  if (!(kobj_tlb = kobject_create_and_add("tlb", kernel_kobj))) {
+    flusher_cleanup(out_kobj_npt);
+    return -ENOMEM;
+  }
 
-  if (IS_ERR_VALUE(ret = sysfs_create_file(kobj_cache, &attr_cache.attr)))
-    goto out_device;
-  if (IS_ERR_VALUE(ret = sysfs_create_file(kobj_tlb, &attr_tlb.attr)))
-    goto out_kobj_cache;
+  if (IS_ERR_VALUE(ret = sysfs_create_file(kobj_cache, &flusher_attr.attr))) {
+    flusher_cleanup(out_kobj_tlb);
+    return ret;
+  }
+  if (kobj_npt &&
+      IS_ERR_VALUE(ret = sysfs_create_file(kobj_npt, &flusher_attr.attr))) {
+    flusher_cleanup(out_sysfs_cache);
+    return ret;
+  }
+  if (IS_ERR_VALUE(ret = sysfs_create_file(kobj_tlb, &flusher_attr.attr))) {
+    flusher_cleanup(out_sysfs_npt);
+    return ret;
+  }
 
   return 0;
-out_kobj_cache:
-  kobject_put(kobj_cache);
-  sysfs_remove_file(kernel_kobj, &attr_cache.attr);
-out_device:
-  device_destroy(class, dev);
-out_class:
-  class_destroy(class);
-out_cdev:
-  cdev_del(&cdev);
-out_dev:
-  unregister_chrdev_region(dev, 1);
-  return (int)ret;
 }
-static void __exit flusher_exit(void) {
-  kobject_put(kobj_tlb);
-  sysfs_remove_file(kernel_kobj, &attr_tlb.attr);
-
-  kobject_put(kobj_cache);
-  sysfs_remove_file(kernel_kobj, &attr_cache.attr);
-
-  device_destroy(class, dev);
-
-  class_destroy(class);
-
-  cdev_del(&cdev);
-
-  unregister_chrdev_region(dev, 1);
-}
+static void __exit flusher_exit(void) { flusher_cleanup(out_full); }
 module_init(flusher_init);
 module_exit(flusher_exit);
 
